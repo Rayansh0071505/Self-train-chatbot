@@ -28,7 +28,7 @@
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
             `;
 
-            // Create chat interface
+            // Create chat interface with improved styling
             container.innerHTML = `
                 <div style="padding: 20px; background: #1a73e8; border-bottom: 1px solid #e8eaed;">
                     <h3 style="margin: 0; color: white; font-size: 18px;">Chat Support</h3>
@@ -115,9 +115,9 @@
                     <h4 style="margin: 0 0 8px 0; color: #1a73e8;">${product.title}</h4>
                     <div style="color: #1e8e3e; font-weight: bold; margin-bottom: 8px;">$${product.price}</div>
                     <p style="margin: 0; color: #5f6368; font-size: 14px;">
-                        ${product.description.length > 100 
-                            ? product.description.substring(0, 100) + '...' 
-                            : product.description}
+                        ${product.description.length > 100 ? 
+                            product.description.substring(0, 100) + '...' : 
+                            product.description}
                     </p>
                 </div>
             `;
@@ -142,7 +142,7 @@
                     ">${message}</span>
                 </div>
             `;
-            
+
             try {
                 const response = await fetch(`${BACKEND_URL}/chat/${this.widgetId}`, {
                     method: 'POST',
@@ -154,11 +154,10 @@
                         user_id: this.widgetId
                     })
                 });
-                
+
                 const data = await response.json();
-                console.log("Response data:", data);  // Debug logging
                 
-                // Build the bot response HTML
+                // Build bot response
                 let responseHTML = `
                     <div style="margin-bottom: 15px;">
                         <span style="
@@ -174,45 +173,33 @@
                         ">${data.message}</span>
                     </div>
                 `;
-                
-                if (data.type === "greeting") {
-                    // Existing code for greeting
-                    responseHTML += `<div style="margin-top: 10px;"><ul style="padding-left: 20px;">`;
-                    data.results.forEach(option => {
-                      if (option && option.category) {
-                        responseHTML += `
-                          <li style="margin-bottom: 5px; cursor: pointer;" 
-                              onclick="document.querySelector('#chat-input').value='Category: ${option.category}'">
-                              ${option.category}
-                          </li>`;
-                      }
-                    });
-                    responseHTML += `</ul></div>`;
-                  
-                  } else if (data.type === "vendor_selection") {
-                    // NEW: Show vendor list
-                    responseHTML += `<div style="margin-top: 10px;"><ul style="padding-left: 20px;">`;
-                    data.results.forEach(option => {
-                      if (option && option.vendor) {
-                        responseHTML += `
-                          <li style="margin-bottom: 5px; cursor: pointer;" 
-                              onclick="document.querySelector('#chat-input').value='Vendor: ${option.vendor}'">
-                              ${option.vendor}
-                          </li>`;
-                      }
-                    });
-                    responseHTML += `</ul></div>`;
-                  
-                  } else if (data.results && data.results.length > 0 && data.type === "product_query") {
-                    // Existing code for product cards
-                    responseHTML += `<div style="margin-top: 10px;">`;
-                    data.results.forEach(product => {
-                      responseHTML += this.formatProductCard(product);
-                    });
-                    responseHTML += `</div>`;
-                  }
-                  
-                
+
+                // Check response type and render accordingly
+                if (data.results && data.results.length > 0) {
+                    if (data.type === "product_query" || data.type === "show_more" || data.type === "deep_search") {
+                        // Render product cards
+                        responseHTML += `<div style="margin-top: 10px;">`;
+                        data.results.forEach(product => {
+                            responseHTML += this.formatProductCard(product);
+                        });
+                        responseHTML += `</div>`;
+                    } else if (data.type === "vendor_query") {
+                        // Render vendor list. Clicking fills the input field.
+                        responseHTML += `<div style="margin-top: 10px;"><ul style="padding-left: 20px;">`;
+                        data.results.forEach(option => {
+                            if (option && option.vendor) {
+                                responseHTML += `
+                                    <li style="margin-bottom: 5px; cursor: pointer;" 
+                                        onclick="document.querySelector('#chat-input').value='Vendor: ${option.vendor}'">
+                                        ${option.vendor}
+                                    </li>
+                                `;
+                            }
+                        });
+                        responseHTML += `</ul></div>`;
+                    }
+                }
+
                 messagesContainer.innerHTML += responseHTML;
                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
             } catch (error) {
@@ -224,11 +211,9 @@
                 `;
             }
         }
-        
-        
     }
 
-    // Initialize widget when the script loads
+    // Initialize widget on load
     window.addEventListener('load', () => {
         if (window.AIChatbot) {
             new ChatbotWidget(window.AIChatbot);
