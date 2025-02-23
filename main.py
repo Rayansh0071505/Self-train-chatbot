@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 #########################################################
-# Global conversation state (to track last search)
+# Global conversation state to track follow-up queries
 #########################################################
 conversation_state: Dict[str, Dict[str, Any]] = {}
 
@@ -82,6 +82,7 @@ class MongoDB:
     async def connect_db(cls, mongodb_url: str, database_name: str):
         cls.client = AsyncIOMotorClient(mongodb_url)
         cls.db = cls.client[database_name]
+        # Create indexes
         await cls.db.users.create_index("user_id", unique=True)
         await cls.db.users.create_index("email", unique=True)
         await cls.db.onboarding.create_index("user_id", unique=True)
@@ -272,16 +273,159 @@ async def map_category_to_available(input_cat: str, available: List[str]) -> Opt
             max_tokens=20,
         )
         mapped = response.choices[0].message["content"].strip().lower()
-        # If GPT returns a category that is not in available, use difflib as fallback.
         if mapped in available:
             return mapped
         else:
-            import difflib
+            # As fallback, use difflib to choose the closest match.
             candidates = difflib.get_close_matches(input_cat, available, n=1, cutoff=0.0)
             return candidates[0] if candidates else None
     except Exception as e:
         logger.error(f"Error mapping category: {str(e)}")
         return None
+
+#########################################################
+# Interpret Follow-up Response using LLM
+#########################################################
+async def interpret_followup(user_input: str) -> str:
+    prompt = (f"Determine if the following response expresses a positive confirmation, negative confirmation, "
+              f"a request to show more recommendations, or a vendor inquiry. "
+              f"Respond with one word: 'confirmation', 'deep_search', 'show_more', or 'vendor_query'.\n"
+              f"Response: {user_input}")
+    try:
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=10
+        )
+        intent = response.choices[0].message["content"].strip().lower()
+        if intent in ["confirmation", "deep_search", "show_more", "vendor_query"]:
+            return intent
+        else:
+            return "unknown"
+    except Exception as e:
+        logger.error(f"Error interpreting followup: {str(e)}")
+        return "unknown"
+
+#########################################################
+# Process Deep Query (when user response is negative)
+#########################################################
+@measure_time
+async def process_deep_query(user_id: str) -> Tuple[str, List[Dict], str]:
+    state = conversation_state.get(user_id)
+    if not state:
+        return ("I don't have your previous query. Could you please rephrase?", [], "need_more_info")
+    deep_filter = {"user_id": user_id}  # remove category filter
+    query_embedding = state.get("embedding")
+    search_results = []
+    try:
+        pine_res = pinecone_index.query(
+            vector=query_embedding,
+            top_k=5,
+            filter=deep_filter,
+            include_metadata=True
+        )
+        for match in pine_res.get("matches", []):
+            metadata = match["metadata"]
+            score = match["score"]
+            search_results.append({
+                "title": metadata.get("title", ""),
+                "description": metadata.get("description", ""),
+                "price": metadata.get("price", 0),
+                "image": metadata.get("image", ""),
+                "product_id": metadata.get("product_id", ""),
+                "vendor": metadata.get("vendor", ""),
+                "category": metadata.get("category", ""),
+                "similarity": round(score, 3)
+            })
+    except Exception as e:
+        logger.error(f"Deep search error: {str(e)}")
+    conversation_state.pop(user_id, None)
+    if search_results:
+        return (
+            "Let me do a deep analysis of your query. Here are additional products:",
+            search_results,
+            "deep_search"
+        )
+    else:
+        return (
+            "I still couldn't find any products matching your query. Please try refining your search further.",
+            [],
+            "no_results"
+        )
+
+#########################################################
+# Process Show More Recommendations
+#########################################################
+@measure_time
+async def process_show_more(user_id: str) -> Tuple[str, List[Dict], str]:
+    state = conversation_state.get(user_id)
+    if not state:
+        return ("I don't have your previous query. Could you please rephrase?", [], "need_more_info")
+    filter_ = state.get("filter", {"user_id": user_id})
+    query_embedding = state.get("embedding")
+    shown_ids = state.get("shown_ids", [])
+    search_results = []
+    try:
+        pine_res = pinecone_index.query(
+            vector=query_embedding,
+            top_k=10,
+            filter=filter_,
+            include_metadata=True
+        )
+        for match in pine_res.get("matches", []):
+            metadata = match["metadata"]
+            pid = metadata.get("product_id", "")
+            if pid not in shown_ids:
+                search_results.append({
+                    "title": metadata.get("title", ""),
+                    "description": metadata.get("description", ""),
+                    "price": metadata.get("price", 0),
+                    "image": metadata.get("image", ""),
+                    "product_id": pid,
+                    "vendor": metadata.get("vendor", ""),
+                    "category": metadata.get("category", ""),
+                    "similarity": round(match["score"], 3)
+                })
+                shown_ids.append(pid)
+                if len(search_results) >= 5:
+                    break
+        state["shown_ids"] = shown_ids
+    except Exception as e:
+        logger.error(f"Show more query error: {str(e)}")
+    if search_results:
+        return (
+            "Here are more products for your query:",
+            search_results,
+            "show_more"
+        )
+    else:
+        return (
+            "No additional products found.",
+            [],
+            "no_more"
+        )
+
+#########################################################
+# Process Vendor Query: Show Unique Vendors for Current Category
+#########################################################
+async def process_vendor_query(user_id: str) -> Tuple[str, List[Dict], str]:
+    db = MongoDB.get_db()
+    state = conversation_state.get(user_id, {})
+    category = state.get("filter", {}).get("category", None)
+    if not category:
+        return ("Please specify a product category first.", [], "need_more_info")
+    vendors = await db.products.distinct("vendor", {"user_id": user_id, "product_type": category})
+    vendors = [v for v in vendors if v]
+    if vendors:
+        vendor_list = [{"vendor": v} for v in vendors]
+        return (
+            "These are the available vendors for the product category:",
+            vendor_list,
+            "vendor_query"
+        )
+    else:
+        return ("No vendors found for the given product category.", [], "no_results")
 
 #########################################################
 # Shopify Service (Sync Products with Lowercase Metadata)
@@ -518,7 +662,7 @@ async def sync_products_endpoint(user_id: str):
             raise HTTPException(status_code=404, detail="User onboarding data not found")
         await db.products.delete_many({"user_id": user_id})
         shopify_service = ShopifyService(onboarding["shopify_store"], onboarding["shopify_token"])
-        sync_results = await shopify_service.sync_products(db, user_id)
+        sync_results = await shopify_service.sync_products(MongoDB.db, user_id)
         product_count = await db.products.count_documents({"user_id": user_id})
         return {
             "status": "success",
@@ -556,7 +700,6 @@ async def process_query(user_query: str, user_id: str) -> Tuple[str, List[Dict],
     if ("buy" in user_query.lower() or "purchase" in user_query.lower()) and not classification.get("direct_product", False):
         classification["direct_product"] = True
 
-    # If no category detected, ask for more details
     if not classification.get("category"):
         return (
             "Could you please provide more details about the product you're interested in? (e.g., specify category or brand)",
@@ -564,38 +707,35 @@ async def process_query(user_query: str, user_id: str) -> Tuple[str, List[Dict],
             "need_more_info"
         )
 
-    # Check available categories from the database
     db = MongoDB.get_db()
     available_categories = await db.products.distinct("product_type", {"user_id": user_id})
     available_categories = [cat.strip().lower() for cat in available_categories if cat]
 
     cat = classification.get("category")
     if cat not in available_categories:
-        # Use GPT to automatically map the classified category to one of the available categories
         mapped_cat = await map_category_to_available(cat, available_categories)
         if mapped_cat:
             logger.info(f"Mapped category '{cat}' to '{mapped_cat}' using GPT")
             classification["category"] = mapped_cat
         else:
-            # If mapping fails, choose the closest match using difflib
-            import difflib
-            candidates = difflib.get_close_matches(cat, available_categories, n=1, cutoff=0.0)
-            if candidates:
-                classification["category"] = candidates[0]
-                logger.info(f"Mapped category '{cat}' to '{candidates[0]}' using difflib")
-            else:
-                # In worst-case, do not use category filter (deep search)
-                classification.pop("category", None)
-                logger.info("No suitable mapping found; category filter removed.")
+            # If mapping fails, remove the category filter for deep search.
+            logger.info("No suitable mapping found; removing category filter for deep search.")
+            classification.pop("category", None)
 
-    # Build Pinecone filter using normalized classification values
     pinecone_filter = {"user_id": user_id}
     if classification.get("category"):
         pinecone_filter["category"] = classification["category"].strip()
     if classification.get("brand"):
         pinecone_filter["vendor"] = classification["brand"].strip()
 
-    # 2) Generate embedding for the full user query (lowercase)
+    # Save state for follow-up queries
+    conversation_state[user_id] = {
+        "filter": pinecone_filter,
+        "embedding": get_embedding(user_query),
+        "query": user_query,
+        "shown_ids": []
+    }
+
     query_embedding = get_embedding(user_query)
     search_results = []
     try:
@@ -618,20 +758,14 @@ async def process_query(user_query: str, user_id: str) -> Tuple[str, List[Dict],
                 "category": metadata.get("category", ""),
                 "similarity": round(score, 3)
             })
+            # Track shown product IDs for "show more"
+            conversation_state[user_id].setdefault("shown_ids", []).append(metadata.get("product_id", ""))
     except Exception as e:
         logger.error(f"Pinecone query error: {str(e)}")
 
-    # Save conversation state for follow-up
-    conversation_state[user_id] = {
-        "filter": pinecone_filter,
-        "embedding": query_embedding,
-        "query": user_query
-    }
-
     if search_results:
-        # Append a follow-up question to ask if the user found what they were looking for.
         return (
-            "Here are some products that match your request. Did you find what you were looking for? (yes/no)",
+            "Here are some products that match your request. Please let me know if these meet your needs.",
             search_results,
             "product_query"
         )
@@ -643,15 +777,14 @@ async def process_query(user_query: str, user_id: str) -> Tuple[str, List[Dict],
         )
 
 #########################################################
-# Process Deep Query (when user replies "no")
+# Process Deep Query (when follow-up indicates negative)
 #########################################################
 @measure_time
 async def process_deep_query(user_id: str) -> Tuple[str, List[Dict], str]:
     state = conversation_state.get(user_id)
     if not state:
         return ("I don't have your previous query. Could you please rephrase?", [], "need_more_info")
-    # Remove the category filter for a deep search
-    deep_filter = {"user_id": user_id}
+    deep_filter = {"user_id": user_id}  # Remove category filter
     query_embedding = state.get("embedding")
     search_results = []
     try:
@@ -691,6 +824,103 @@ async def process_deep_query(user_id: str) -> Tuple[str, List[Dict], str]:
         )
 
 #########################################################
+# Process Show More Recommendations
+#########################################################
+@measure_time
+async def process_show_more(user_id: str) -> Tuple[str, List[Dict], str]:
+    state = conversation_state.get(user_id)
+    if not state:
+        return ("I don't have your previous query. Could you please rephrase?", [], "need_more_info")
+    filter_ = state.get("filter", {"user_id": user_id})
+    query_embedding = state.get("embedding")
+    shown_ids = state.get("shown_ids", [])
+    search_results = []
+    try:
+        pine_res = pinecone_index.query(
+            vector=query_embedding,
+            top_k=10,
+            filter=filter_,
+            include_metadata=True
+        )
+        for match in pine_res.get("matches", []):
+            metadata = match["metadata"]
+            pid = metadata.get("product_id", "")
+            if pid not in shown_ids:
+                search_results.append({
+                    "title": metadata.get("title", ""),
+                    "description": metadata.get("description", ""),
+                    "price": metadata.get("price", 0),
+                    "image": metadata.get("image", ""),
+                    "product_id": pid,
+                    "vendor": metadata.get("vendor", ""),
+                    "category": metadata.get("category", ""),
+                    "similarity": round(match["score"], 3)
+                })
+                shown_ids.append(pid)
+                if len(search_results) >= 5:
+                    break
+        state["shown_ids"] = shown_ids
+    except Exception as e:
+        logger.error(f"Show more query error: {str(e)}")
+    if search_results:
+        return (
+            "Here are more products for your query:",
+            search_results,
+            "show_more"
+        )
+    else:
+        return (
+            "No additional products found.",
+            [],
+            "no_more"
+        )
+
+#########################################################
+# Process Vendor Query: Retrieve Distinct Vendors for the Category
+#########################################################
+async def process_vendor_query(user_id: str) -> Tuple[str, List[Dict], str]:
+    db = MongoDB.get_db()
+    state = conversation_state.get(user_id, {})
+    category = state.get("filter", {}).get("category", None)
+    if not category:
+        return ("Please specify a product category first.", [], "need_more_info")
+    vendors = await db.products.distinct("vendor", {"user_id": user_id, "product_type": category})
+    vendors = [v for v in vendors if v]
+    if vendors:
+        vendor_list = [{"vendor": v} for v in vendors]
+        return (
+            "These are the available vendors for the product category:",
+            vendor_list,
+            "vendor_query"
+        )
+    else:
+        return ("No vendors found for the given product category.", [], "no_results")
+
+#########################################################
+# Interpret Follow-up Response using LLM
+#########################################################
+async def interpret_followup(user_input: str) -> str:
+    prompt = (f"Determine if the following response expresses a positive confirmation, negative confirmation, "
+              f"a request to show more recommendations, or a vendor inquiry. "
+              f"Respond with one word: 'confirmation', 'deep_search', 'show_more', or 'vendor_query'.\n"
+              f"Response: {user_input}")
+    try:
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=10
+        )
+        intent = response.choices[0].message["content"].strip().lower()
+        if intent in ["confirmation", "deep_search", "show_more", "vendor_query"]:
+            return intent
+        else:
+            return "unknown"
+    except Exception as e:
+        logger.error(f"Error interpreting followup: {str(e)}")
+        return "unknown"
+
+#########################################################
 # Chat Endpoint
 #########################################################
 @app.post("/chat/{user_id}")
@@ -701,21 +931,23 @@ async def chat(user_id: str, query: ChatQuery, db: Any = Depends(MongoDB.get_db)
         raise HTTPException(status_code=404, detail="User not found")
 
     user_input = query.query.strip().lower()
-    # Check if the user is responding to the follow-up question
-    if user_input in ["yes", "no"] and user_id in conversation_state:
-        if user_input == "yes":
-            # User is satisfied with current search
+
+    # Check if this is a follow-up response based on previous conversation state
+    if user_id in conversation_state:
+        followup_intent = await interpret_followup(user_input)
+        if followup_intent == "confirmation":
             conversation_state.pop(user_id, None)
-            return {"type": "confirmation", "message": "Great, glad you found what you were looking for!"}
-        else:
-            # User is not satisfied; perform deep search (remove category filter)
+            return {"type": "confirmation", "message": "Great, I'm glad you found what you were looking for!"}
+        elif followup_intent == "deep_search":
             message, products, intent = await process_deep_query(user_id)
-            return {
-                "type": intent,
-                "message": message,
-                "has_products": len(products) > 0,
-                "results": products
-            }
+            return {"type": intent, "message": message, "has_products": len(products) > 0, "results": products}
+        elif followup_intent == "show_more":
+            message, products, intent = await process_show_more(user_id)
+            return {"type": intent, "message": message, "has_products": len(products) > 0, "results": products}
+        elif followup_intent == "vendor_query":
+            message, vendors, intent = await process_vendor_query(user_id)
+            return {"type": intent, "message": message, "has_products": len(vendors) > 0, "results": vendors}
+        # If the intent is unknown, fall through to normal query processing.
 
     # Otherwise, process as a new query
     message, products, intent = await process_query(query.query, user_id)
