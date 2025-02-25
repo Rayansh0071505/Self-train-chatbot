@@ -342,6 +342,23 @@ class ShopifyService:
             ]
             text_parts.extend(variant_parts)
         return ' '.join(filter(None, text_parts))
+    def get_store_info(self) -> Dict:
+        """Fetch store info from Shopify."""
+        try:
+            shop = shopify.Shop.current()
+            if not shop:
+                raise ValueError("Could not retrieve shop information")
+            return {
+                'name': str(shop.name) if hasattr(shop, 'name') else '',
+                'email': str(shop.email) if hasattr(shop, 'email') else '',
+                'domain': str(shop.domain) if hasattr(shop, 'domain') else '',
+                'country': str(shop.country) if hasattr(shop, 'country') else '',
+                'currency': str(shop.currency) if hasattr(shop, 'currency') else '',
+                'timezone': str(shop.timezone) if hasattr(shop, 'timezone') else ''
+            }
+        except Exception as e:
+            logger.error(f"Error getting store info: {str(e)}")
+            raise
 
     async def sync_products(self, db: Any, user_id: str):
         try:
@@ -559,9 +576,175 @@ async def get_products(user_id: str):
 #########################################################
 # Process Query: LLM Classification + Auto Category Mapping via GPT + Pinecone Filtering + Semantic Search
 #########################################################
+
+async def process_show_more(user_id: str) -> Tuple[str, List[Dict], str]:
+    """Process a request to show more products from the same category"""
+    state = conversation_state.get(user_id)
+    if not state:
+        return ("I don't have your previous search. Could you please make a new search request?", [], "need_more_info")
+
+    # Get the current filter and query information
+    current_filter = state.get("filter", {"user_id": user_id})
+    query_embedding = state.get("embedding")
+    original_query = state.get("query", "")
+    
+    # Initialize last_results if it doesn't exist
+    if "last_results" not in state:
+        state["last_results"] = []
+        
+    last_results = state.get("last_results", [])
+    current_page = state.get("page", 1)
+    
+    # Log what we're doing
+    filter_desc = " and ".join([f"{k}: {v}" for k, v in current_filter.items() if k != "user_id"])
+    logger.info(f"Showing more results for query '{original_query}' with filter: {filter_desc}, page {current_page+1}")
+    logger.info(f"Excluding previously shown products: {last_results}")
+    
+    # Get category and brand info for better messaging
+    category = current_filter.get("category", "")
+    vendor = current_filter.get("vendor", "")
+    
+    search_results = []
+    already_shown_ids = set(last_results)  # Convert to set for faster lookups
+    
+    try:
+        # Request a larger number of results to account for filtering
+        pine_res = pinecone_index.query(
+            vector=query_embedding,
+            top_k=50,  # Request more to ensure we have enough after filtering
+            filter=current_filter,
+            include_metadata=True
+        )
+        
+        logger.info(f"Found {len(pine_res.get('matches', []))} total matches before filtering")
+        
+        # Filter out products we've already shown
+        new_results = []
+        for match in pine_res.get("matches", []):
+            metadata = match["metadata"]
+            product_id = metadata.get("product_id", "")
+            
+            # Only include if not in last_results
+            if product_id and product_id not in already_shown_ids:
+                score = match["score"]
+                new_results.append({
+                    "title": metadata.get("title", ""),
+                    "description": metadata.get("description", ""),
+                    "price": metadata.get("price", 0),
+                    "image": metadata.get("image", ""),
+                    "product_id": product_id,
+                    "vendor": metadata.get("vendor", ""),
+                    "category": metadata.get("category", ""),
+                    "similarity": round(score, 3)
+                })
+                
+                # Keep track of what we've shown
+                already_shown_ids.add(product_id)
+                
+                # Cap at 10 new results
+                if len(new_results) >= 10:
+                    break
+        
+        # Sort by similarity
+        new_results = sorted(new_results, key=lambda x: x["similarity"], reverse=True)
+        search_results = new_results
+        
+        logger.info(f"Found {len(search_results)} new matches for 'show more'")
+        
+    except Exception as e:
+        logger.error(f"Show more query error: {str(e)}")
+
+    # Update conversation state with new results
+    if user_id in conversation_state:
+        # Update the page number
+        conversation_state[user_id]["page"] = current_page + 1
+        
+        # Add new product IDs to last_results
+        conversation_state[user_id]["last_results"] = list(already_shown_ids)
+        
+        # Log the updated tracking
+        logger.info(f"Updated last_results tracking: {conversation_state[user_id]['last_results']}")
+    
+    if search_results:
+        # Construct appropriate message based on filter
+        if vendor and category:
+            message = f"Here are more {vendor} {category} products (page {current_page+1}). Did you find what you were looking for?"
+        elif category:
+            message = f"Here are more {category} products (page {current_page+1}). Did you find what you were looking for?"
+        else:
+            message = f"Here are more products that match your request (page {current_page+1}). Did you find what you were looking for?"
+        
+        return (message, search_results, "product_query")
+    else:
+        # No more results found
+        if vendor and category:
+            message = f"I don't have any more {vendor} {category} products to show you. Would you like to see products from other brands?"
+        elif category:
+            message = f"I don't have any more {category} products to show you. Would you like to see products from other categories?"
+        else:
+            message = "I don't have any more products that match your request. Would you like to try a different search?"
+        
+        return (message, [], "no_more_results")
+    
+async def detect_user_intent(query: str) -> Dict:
+    """
+    Uses LLM to detect the intent of the user query.
+    Returns a dictionary with intent classification.
+    """
+    system_instructions = (
+        "You are a user intent classifier. Parse the user's query into a JSON object with these keys:\n"
+        "  - intent: string (one of: 'greeting', 'show_more', 'product_search', 'brand_selection', 'confirmation', 'help')\n"
+        "  - confidence: float (between 0 and 1)\n"
+        "Return only valid JSON with no extra text."
+    )
+    user_prompt = f"User query: \"{query}\""
+    try:
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_instructions},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.0,
+            max_tokens=100
+        )
+        content = response.choices[0].message["content"].strip()
+        intent_data = {}
+        try:
+            intent_data = json.loads(content)
+            logger.info(f"Detected intent: {intent_data.get('intent', 'unknown')} with confidence: {intent_data.get('confidence', 0)}")
+        except Exception as e:
+            logger.warning(f"Could not parse JSON from LLM intent detection: {str(e)}")
+        return intent_data
+    except Exception as e:
+        logger.error(f"Error detecting user intent: {str(e)}")
+        return {"intent": "unknown", "confidence": 0.0}
+    
 @measure_time
 async def process_query(user_query: str, user_id: str) -> Tuple[str, List[Dict], str]:
-    """Initial search with category mapping and filtering"""
+    """Initial search with category mapping and filtering and brand selection"""
+    # First, detect user intent using LLM
+    intent_data = await detect_user_intent(user_query)
+    user_intent = intent_data.get("intent", "unknown")
+    confidence = intent_data.get("confidence", 0.0)
+    
+    # Handle different intents
+    if user_intent == "greeting" and confidence > 0.7:
+        # Return a greeting response instead of product search
+        return (
+            f"Hello! How can I help you today? You can ask about products or search for specific items.",
+            [],
+            "greeting"
+        )
+    
+    # Check if this is a "show more" request
+    if user_intent == "show_more" and confidence > 0.7 and user_id in conversation_state:
+        return await process_show_more(user_id)
+    
+    # Check if this is a brand selection from a previous query
+    if user_id in conversation_state and conversation_state[user_id].get("awaiting_brand_selection", False):
+        return await process_brand_selection(user_query, user_id)
+    
     # 1) Classify the query using LLM
     classification = await classify_user_query(user_query)
     logger.info(f"Classification: {classification}")
@@ -575,14 +758,47 @@ async def process_query(user_query: str, user_id: str) -> Tuple[str, List[Dict],
     available_categories = [cat.strip().lower() for cat in available_categories if cat]
 
     # Try to map the category if classification provided one
+    category_found = False
     if classification.get("category"):
         mapped_category = await map_category_to_available(classification["category"], available_categories)
         if mapped_category:
             logger.info(f"Mapped category '{classification['category']}' to '{mapped_category}'")
             pinecone_filter["category"] = mapped_category
             classification["category"] = mapped_category
+            category_found = True
         else:
             logger.info(f"No category mapping found for '{classification['category']}'")
+    
+    # Handle brand selection if category is found but no brand is specified
+    if category_found and not classification.get("brand"):
+        # Get available brands/vendors for this category
+        available_brands = await db.products.distinct(
+            "vendor", 
+            {"user_id": user_id, "product_type": classification["category"]}
+        )
+        available_brands = [brand.strip() for brand in available_brands if brand]
+        
+        if available_brands:
+            # Save state for the brand selection follow-up
+            conversation_state[user_id] = {
+                "category": classification["category"],
+                "query": user_query,
+                "awaiting_brand_selection": True,
+                "available_brands": available_brands
+            }
+            
+            # Format brands as a numbered list
+            brand_list = "\n".join([f"{i+1}. {brand}" for i, brand in enumerate(available_brands)])
+            
+            return (
+                f"For {classification['category']}, we have the following brands available. Please select one:\n\n{brand_list}",
+                [],
+                "brand_selection"
+            )
+    
+    # If we have both category and brand, add brand to filter
+    if classification.get("brand"):
+        pinecone_filter["vendor"] = classification["brand"]
     
     # Generate embedding for the full user query (lowercase)
     query_embedding = get_embedding(user_query.lower())
@@ -592,7 +808,7 @@ async def process_query(user_query: str, user_id: str) -> Tuple[str, List[Dict],
     
     search_results = []
     try:
-        # Search with category filter
+        # Search with category and potentially brand filter
         pine_res = pinecone_index.query(
             vector=query_embedding,
             top_k=10,
@@ -600,7 +816,7 @@ async def process_query(user_query: str, user_id: str) -> Tuple[str, List[Dict],
             include_metadata=True
         )
         
-        logger.info(f"Found {len(pine_res.get('matches', []))} matches with category filter")
+        logger.info(f"Found {len(pine_res.get('matches', []))} matches with filter")
         
         for match in pine_res.get("matches", []):
             metadata = match["metadata"]
@@ -623,17 +839,26 @@ async def process_query(user_query: str, user_id: str) -> Tuple[str, List[Dict],
     except Exception as e:
         logger.error(f"Pinecone query error: {str(e)}")
 
-    # Save state for potential follow-up
-    conversation_state[user_id] = {
-        "filter": pinecone_filter,
-        "embedding": query_embedding,
-        "query": user_query,
-        "classification": classification
-    }
+    # Save state for potential follow-up (but not overwriting brand selection state)
+    if not conversation_state.get(user_id, {}).get("awaiting_brand_selection", False):
+        # Save all product IDs we've shown to the user
+        shown_product_ids = [r["product_id"] for r in search_results if "product_id" in r]
+        
+        conversation_state[user_id] = {
+            "filter": pinecone_filter,
+            "embedding": query_embedding,
+            "query": user_query,
+            "classification": classification,
+            "last_results": shown_product_ids,  # Track shown product IDs
+            "page": 1
+        }
+        
+        # Log the tracked products
+        logger.info(f"Tracking {len(shown_product_ids)} shown products: {shown_product_ids}")
 
     if search_results:
         return (
-            "Here are some products that match your request. Did you find what you were looking for? (yes/no)",
+            "Here are some products that match your request. Did you find what you were looking for? (yes/no) You can also ask to see more products if you need additional options.",
             search_results,
             "product_query"
         )
@@ -641,11 +866,131 @@ async def process_query(user_query: str, user_id: str) -> Tuple[str, List[Dict],
         # If no results with category filter, inform user we'll try a broader search
         return await process_deep_query(user_id)
 
+async def process_brand_selection(user_input: str, user_id: str) -> Tuple[str, List[Dict], str]:
+    """Process a brand selection from the user"""
+    state = conversation_state.get(user_id, {})
+    if not state.get("awaiting_brand_selection"):
+        return ("I don't understand. Could you please rephrase your question?", [], "need_more_info")
+    
+    available_brands = state.get("available_brands", [])
+    category = state.get("category", "")
+    original_query = state.get("query", "")
+    
+    # Try to match the user input to a brand
+    selected_brand = None
+    
+    # Check if user entered a number
+    try:
+        selection_idx = int(user_input.strip()) - 1
+        if 0 <= selection_idx < len(available_brands):
+            selected_brand = available_brands[selection_idx]
+    except ValueError:
+        # Not a number, try to match by name
+        user_input_lower = user_input.lower().strip()
+        
+        # Exact match
+        for brand in available_brands:
+            if brand.lower() == user_input_lower:
+                selected_brand = brand
+                break
+        
+        # Partial match if no exact match found
+        if not selected_brand:
+            for brand in available_brands:
+                if user_input_lower in brand.lower():
+                    selected_brand = brand
+                    break
+    
+    if not selected_brand:
+        # Could not determine brand, ask again
+        brand_list = "\n".join([f"{i+1}. {brand}" for i, brand in enumerate(available_brands)])
+        return (
+            f"I couldn't match that to any of our available brands. Please try again by selecting a number or typing the brand name:\n\n{brand_list}",
+            [],
+            "brand_selection"
+        )
+    
+    # Brand identified, now search with this brand
+    logger.info(f"Selected brand: {selected_brand} for category: {category}")
+    
+    # Build filter with user_id, category and brand
+    pinecone_filter = {
+        "user_id": user_id,
+        "category": category,
+        "vendor": selected_brand
+    }
+    
+    # Generate embedding for the original query
+    query_embedding = get_embedding(original_query.lower())
+    
+    search_results = []
+    try:
+        # Search with category and brand filter
+        pine_res = pinecone_index.query(
+            vector=query_embedding,
+            top_k=10,
+            filter=pinecone_filter,
+            include_metadata=True
+        )
+        
+        logger.info(f"Found {len(pine_res.get('matches', []))} matches with category and brand filter")
+        
+        for match in pine_res.get("matches", []):
+            metadata = match["metadata"]
+            score = match["score"]
+            
+            search_results.append({
+                "title": metadata.get("title", ""),
+                "description": metadata.get("description", ""),
+                "price": metadata.get("price", 0),
+                "image": metadata.get("image", ""),
+                "product_id": metadata.get("product_id", ""),
+                "vendor": metadata.get("vendor", ""),
+                "category": metadata.get("category", ""),
+                "similarity": round(score, 3)
+            })
+            
+        # Sort by similarity
+        search_results = sorted(search_results, key=lambda x: x["similarity"], reverse=True)
+        
+    except Exception as e:
+        logger.error(f"Pinecone query error: {str(e)}")
+    
+    # Reset state
+    conversation_state[user_id] = {
+        "filter": pinecone_filter,
+        "embedding": query_embedding,
+        "query": original_query
+    }
+    
+    if search_results:
+        return (
+            f"Here are {selected_brand} {category} products that match your request. Did you find what you were looking for? (yes/no)",
+            search_results,
+            "product_query"
+        )
+    else:
+        # No results with brand filter, try just category
+        return (
+            f"I couldn't find any {selected_brand} {category} products. Let me show you all {category} products instead.",
+            [],
+            "no_brand_results"
+        )
+
 async def process_deep_query(user_id: str) -> Tuple[str, List[Dict], str]:
     """Deep search across all categories when category mapping fails or user requests more results"""
     state = conversation_state.get(user_id)
     if not state:
         return ("I don't have your previous query. Could you please rephrase?", [], "need_more_info")
+
+    # Skip deep query if awaiting brand selection
+    if state.get("awaiting_brand_selection", False):
+        brand_list = "\n".join([f"{i+1}. {brand}" for i, brand in enumerate(state.get("available_brands", []))])
+        return (
+            f"Please select a brand from the list:\n\n{brand_list}",
+            [],
+            "brand_selection"
+        )
 
     # Use only user_id filter for deep search
     deep_filter = {"user_id": user_id}
@@ -688,7 +1033,8 @@ async def process_deep_query(user_id: str) -> Tuple[str, List[Dict], str]:
         logger.error(f"Deep search error: {str(e)}")
 
     # Clear conversation state
-    conversation_state.pop(user_id, None)
+    if not state.get("awaiting_brand_selection", False):
+        conversation_state.pop(user_id, None)
 
     if search_results:
         return (
@@ -702,6 +1048,7 @@ async def process_deep_query(user_id: str) -> Tuple[str, List[Dict], str]:
             [],
             "no_results"
         )
+
 @measure_time
 @app.post("/chat/{user_id}")
 async def chat(user_id: str, query: ChatQuery, db: Any = Depends(MongoDB.get_db)):
@@ -711,11 +1058,11 @@ async def chat(user_id: str, query: ChatQuery, db: Any = Depends(MongoDB.get_db)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    user_input = query.query.strip().lower()
+    user_input = query.query.strip()
     
-    # Handle follow-up responses
-    if user_input in ["yes", "no"] and user_id in conversation_state:
-        if user_input == "yes":
+    # First detect intent for yes/no responses to avoid unnecessary LLM calls
+    if user_input.lower() in ["yes", "no", "y", "n"] and user_id in conversation_state and not conversation_state[user_id].get("awaiting_brand_selection", False):
+        if user_input.lower() in ["yes", "y"]:
             # User found what they wanted
             conversation_state.pop(user_id, None)
             return {"type": "confirmation", "message": "Great! Let me know if you need anything else."}
@@ -729,8 +1076,73 @@ async def chat(user_id: str, query: ChatQuery, db: Any = Depends(MongoDB.get_db)
                 "results": products
             }
 
-    # Handle new query
+    # For other inputs, use the LLM to determine intent
+    intent_data = await detect_user_intent(user_input)
+    user_intent = intent_data.get("intent", "unknown")
+    confidence = intent_data.get("confidence", 0.0)
+    
+    # Handle show more intent
+    if user_intent == "show_more" and confidence > 0.7 and user_id in conversation_state:
+        message, products, intent = await process_show_more(user_id)
+        return {
+            "type": intent,
+            "message": message,
+            "has_products": len(products) > 0,
+            "results": products
+        }
+
+    # Handle new query or brand selection
     message, products, intent = await process_query(query.query, user_id)
+
+    # Handle no brand results
+    if intent == "no_brand_results":
+        # Try to show all products in the category without brand filter
+        category = conversation_state.get(user_id, {}).get("filter", {}).get("category")
+        if category:
+            db = MongoDB.get_db()
+            pinecone_filter = {"user_id": user_id, "category": category}
+            query_embedding = conversation_state[user_id].get("embedding")
+            
+            try:
+                pine_res = pinecone_index.query(
+                    vector=query_embedding,
+                    top_k=10,
+                    filter=pinecone_filter,
+                    include_metadata=True
+                )
+                
+                for match in pine_res.get("matches", []):
+                    metadata = match["metadata"]
+                    score = match["score"]
+                    
+                    products.append({
+                        "title": metadata.get("title", ""),
+                        "description": metadata.get("description", ""),
+                        "price": metadata.get("price", 0),
+                        "image": metadata.get("image", ""),
+                        "product_id": metadata.get("product_id", ""),
+                        "vendor": metadata.get("vendor", ""),
+                        "category": metadata.get("category", ""),
+                        "similarity": round(score, 3)
+                    })
+                
+                # Sort by similarity
+                products = sorted(products, key=lambda x: x["similarity"], reverse=True)
+                
+                # Update conversation state with these results
+                conversation_state[user_id] = {
+                    "filter": pinecone_filter,
+                    "embedding": query_embedding,
+                    "query": conversation_state[user_id].get("query", ""),
+                    "last_results": [p["product_id"] for p in products],
+                    "page": 1
+                }
+                
+                intent = "product_query"
+                message = f"Here are {category} products that match your request. Did you find what you were looking for? (yes/no) You can also ask to see more products if you need additional options."
+                
+            except Exception as e:
+                logger.error(f"Fallback query error: {str(e)}")
 
     # Handle language translation if needed
     detected_lang = await detect_language_openai(query.query)
@@ -743,9 +1155,8 @@ async def chat(user_id: str, query: ChatQuery, db: Any = Depends(MongoDB.get_db)
         "type": intent,
         "message": message,
         "has_products": len(products) > 0,
-        "results": products
+        "results": products if products else []
     }
-
 #########################################################
 # Run the Application
 #########################################################

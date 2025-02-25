@@ -122,6 +122,116 @@
                 </div>
             `;
         }
+        
+        // Extract brands from a message string using various patterns
+        extractBrands(message) {
+            // Try to find numbered list format first (1. Brand)
+            const numberedListPattern = /\d+\.\s*([a-zA-Z0-9 ]+)(?=(?:\s+\d+\.|$))/g;
+            let matches = [...message.matchAll(numberedListPattern)];
+            
+            if (matches.length > 0) {
+                return matches.map(match => match[1].trim());
+            }
+            
+            // If that fails, look for brands following a colon
+            const colonPattern = /(?:brands|brand).*?:\s*(.*)/i;
+            const colonMatch = message.match(colonPattern);
+            
+            if (colonMatch) {
+                // Split by commas or "and"
+                return colonMatch[1].split(/,|\sand\s/).map(brand => brand.trim());
+            }
+            
+            // As a fallback, look for any capitalized words that might be brands
+            const brandNames = ["adidas", "nike", "puma", "reebok", "asics", "converse", 
+                                "dr martens", "new balance", "vans", "under armour"];
+            
+            const foundBrands = [];
+            for (const brand of brandNames) {
+                if (message.toLowerCase().includes(brand.toLowerCase())) {
+                    foundBrands.push(brand);
+                }
+            }
+            
+            return foundBrands;
+        }
+        
+        // Create brand selection UI
+        createBrandSelection(brands) {
+            // Create a container for the brand options
+            const container = document.createElement('div');
+            container.className = 'brand-selection-container';
+            container.style.cssText = `
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 10px;
+                margin-top: 15px;
+                margin-bottom: 15px;
+            `;
+            
+            // Add brand option cards
+            brands.forEach((brand, index) => {
+                const card = document.createElement('div');
+                card.className = 'brand-option';
+                card.style.cssText = `
+                    background: white;
+                    border: 1px solid #e0e0e0;
+                    border-radius: 12px;
+                    padding: 15px;
+                    text-align: center;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+                `;
+                
+                // Add number
+                const numberElement = document.createElement('div');
+                numberElement.style.cssText = `
+                    font-weight: bold;
+                    color: #1a73e8;
+                    margin-bottom: 5px;
+                `;
+                numberElement.textContent = (index + 1).toString();
+                
+                // Add brand name
+                const nameElement = document.createElement('div');
+                nameElement.style.cssText = `
+                    color: #202124;
+                `;
+                nameElement.textContent = brand;
+                
+                // Add to card
+                card.appendChild(numberElement);
+                card.appendChild(nameElement);
+                
+                // Add hover effects
+                card.addEventListener('mouseover', () => {
+                    card.style.borderColor = '#1a73e8';
+                    card.style.boxShadow = '0 4px 8px rgba(0,0,0,0.1)';
+                });
+                
+                card.addEventListener('mouseout', () => {
+                    card.style.borderColor = '#e0e0e0';
+                    card.style.boxShadow = '0 2px 4px rgba(0,0,0,0.05)';
+                });
+                
+                // Add click handler
+                card.addEventListener('click', () => {
+                    const input = document.querySelector('#chat-input');
+                    const sendButton = document.querySelector('#send-button');
+                    
+                    if (input && sendButton) {
+                        input.value = brand;
+                        sendButton.click();
+                    }
+                });
+                
+                // Add to container
+                container.appendChild(card);
+            });
+            
+            return container;
+        }
 
         async sendMessage(message) {
             const messagesContainer = document.querySelector('#chat-messages');
@@ -142,6 +252,8 @@
                     ">${message}</span>
                 </div>
             `;
+            
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
             try {
                 const response = await fetch(`${BACKEND_URL}/chat/${this.widgetId}`, {
@@ -158,57 +270,65 @@
                 const data = await response.json();
                 
                 // Build bot response
-                let responseHTML = `
-                    <div style="margin-bottom: 15px;">
-                        <span style="
-                            background: #f1f3f4;
-                            color: #202124;
-                            padding: 10px 15px;
-                            border-radius: 18px;
-                            border-bottom-left-radius: 5px;
-                            display: inline-block;
-                            max-width: 80%;
-                            word-wrap: break-word;
-                            font-size: 14px;
-                        ">${data.message}</span>
-                    </div>
+                const botMessageContainer = document.createElement('div');
+                botMessageContainer.style.marginBottom = '15px';
+                
+                // Add text message
+                const textSpan = document.createElement('span');
+                textSpan.style.cssText = `
+                    background: #f1f3f4;
+                    color: #202124;
+                    padding: 10px 15px;
+                    border-radius: 18px;
+                    border-bottom-left-radius: 5px;
+                    display: inline-block;
+                    max-width: 80%;
+                    word-wrap: break-word;
+                    font-size: 14px;
                 `;
+                textSpan.textContent = data.message;
+                botMessageContainer.appendChild(textSpan);
+                messagesContainer.appendChild(botMessageContainer);
 
-                // Check response type and render accordingly
-                if (data.results && data.results.length > 0) {
-                    if (data.type === "product_query" || data.type === "show_more" || data.type === "deep_search") {
-                        // Render product cards
-                        responseHTML += `<div style="margin-top: 10px;">`;
-                        data.results.forEach(product => {
-                            responseHTML += this.formatProductCard(product);
-                        });
-                        responseHTML += `</div>`;
-                    } else if (data.type === "vendor_query") {
-                        // Render vendor list. Clicking fills the input field.
-                        responseHTML += `<div style="margin-top: 10px;"><ul style="padding-left: 20px;">`;
-                        data.results.forEach(option => {
-                            if (option && option.vendor) {
-                                responseHTML += `
-                                    <li style="margin-bottom: 5px; cursor: pointer;" 
-                                        onclick="document.querySelector('#chat-input').value='Vendor: ${option.vendor}'">
-                                        ${option.vendor}
-                                    </li>
-                                `;
-                            }
-                        });
-                        responseHTML += `</ul></div>`;
+                // Check for brand selection in the message
+                const messageContainsBrandSelection = 
+                    (data.type === "brand_selection") || 
+                    data.message.includes("select one") ||
+                    data.message.match(/\d+\.\s+[a-zA-Z]/) !== null;
+                
+                if (messageContainsBrandSelection) {
+                    // Extract brands from the message
+                    const brands = this.extractBrands(data.message);
+                    
+                    if (brands.length > 0) {
+                        console.log("Found brands:", brands);
+                        // Create and add brand selection UI
+                        const brandSelection = this.createBrandSelection(brands);
+                        messagesContainer.appendChild(brandSelection);
                     }
                 }
-
-                messagesContainer.innerHTML += responseHTML;
+                // Handle product results
+                else if (data.results && data.results.length > 0) {
+                    const resultsContainer = document.createElement('div');
+                    resultsContainer.style.marginTop = '10px';
+                    
+                    if (data.type === "product_query" || data.type === "show_more" || data.type === "deep_search") {
+                        // Render product cards
+                        data.results.forEach(product => {
+                            resultsContainer.innerHTML += this.formatProductCard(product);
+                        });
+                    }
+                    
+                    messagesContainer.appendChild(resultsContainer);
+                }
+                
                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
             } catch (error) {
                 console.error('Error sending message:', error);
-                messagesContainer.innerHTML += `
-                    <div style="margin-bottom: 15px; color: #d93025; font-size: 14px;">
-                        Error: Could not send message. Please try again later.
-                    </div>
-                `;
+                const errorDiv = document.createElement('div');
+                errorDiv.style.cssText = "margin-bottom: 15px; color: #d93025; font-size: 14px;";
+                errorDiv.textContent = "Error: Could not send message. Please try again later.";
+                messagesContainer.appendChild(errorDiv);
             }
         }
     }
